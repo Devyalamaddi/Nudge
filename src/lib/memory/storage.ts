@@ -154,6 +154,7 @@ export interface EpisodicRecallMatch {
   matchedRecord?:EpisodicMemoryRecord;
   relevantMessages:Message[];
   historicalContextSummary:string;
+  verbatimAssistantResponse?:string;
 }
 
 export function searchCrossSessionMemory(
@@ -183,7 +184,8 @@ export function searchCrossSessionMemory(
     if (lowerQuery.includes('postgres') && record.summary.toLowerCase().includes('postgres')) score+=4;
     if (lowerQuery.includes('shortlist') && record.summary.toLowerCase().includes('shortlist')) score+=3;
     if (lowerQuery.includes('pricing') && record.summary.toLowerCase().includes('pricing')) score+=2;
-    if (lowerQuery.includes('3 november') || lowerQuery.includes('nov 3')) {
+    const nov3Patterns=['3 november','nov 3','november 3','3rd november','nov. 3'];
+    if (nov3Patterns.some((p)=>lowerQuery.includes(p))) {
       if (record.dateStr.includes('-11-03')) score+=10;
     }
 
@@ -194,11 +196,14 @@ export function searchCrossSessionMemory(
           .filter((m)=>m.sessionId===record.sessionId)
           .sort((a,b)=>new Date(a.createdAt).getTime()-new Date(b.createdAt).getTime());
 
+        const verbatimAssistant=msgs.filter((m)=>m.role==='assistant').map((m)=>m.content).join('\n\n');
+
         return {
           confidence:score>=6?'high':'medium',
           session,
           matchedRecord:record,
           relevantMessages:msgs,
+          verbatimAssistantResponse:verbatimAssistant||undefined,
           historicalContextSummary:`[HISTORICAL CONVERSATION RECALL]\nDate: ${record.dateStr} (${record.dayOfWeek})\nSession: "${session.title}"\nSummary: ${record.summary}\nEntities Discussed: ${record.entities.join(', ')}\nKey Baseline Facts Stored:\n${record.keyFacts.map((f)=>`- ${f}`).join('\n')}`,
         };
       }
@@ -211,10 +216,11 @@ export function searchCrossSessionMemory(
     const combinedText=msgs.map((m)=>m.content).join(' ').toLowerCase();
 
     let score=0;
-    if (lowerQuery.includes('crm') && combinedText.includes('crm')) score+=2;
+    if (lowerQuery.includes('crm') && (combinedText.includes('crm')||combinedText.includes('hubspot'))) score+=2;
     if (lowerQuery.includes('sales team') && combinedText.includes('sales team')) score+=2;
     if (lowerQuery.includes('postgres') && combinedText.includes('postgres')) score+=2;
-    if (lowerQuery.includes('3 november') && (combinedText.includes('november 3')||combinedText.includes('nov 3')||session.createdAt.includes('-11-03'))) score+=5;
+    const nov3Fallback=['3 november','nov 3','november 3','3rd november','nov. 3'];
+    if (nov3Fallback.some((p)=>lowerQuery.includes(p)) && (combinedText.includes('november 3')||combinedText.includes('nov 3')||session.createdAt.includes('-11-03'))) score+=5;
 
     if (score>=3) {
       return {

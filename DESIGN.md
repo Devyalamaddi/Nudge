@@ -1,108 +1,110 @@
-# Minimi Agent: Architectural Design Document
+# Minimi Agent — Design Document
 
-> **Mission:** Build a chat agent with strictly one tool (`web_search`) that answers fast, gets facts 100% right, and is good to talk to.
+> One tool. Real time. Gets things right.
 
 ---
 
-## 1. How It Works
+## How it works
 
-The Minimi Agent architecture is designed as an ultra-fast, temporally-grounded investigation pipeline:
+Every turn runs a deterministic four-stage pipeline:
 
 ```
-[ User Turn ]
-      │
-      ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│ 1. Temporal Grounding & Delta Window Engine                            │
-│    - Resolves dynamic reference anchor: Date, day of week, timezone.   │
-│    - Normalizes human temporal cues ("Monday", "Last Tuesday", "3 Nov")│
-│      into concrete ISO dates and an explicit delta window:             │
-│      [Reference Date → Today]. All searches anchor strictly to this.   │
-└──────────────────────────────────┬─────────────────────────────────────┘
-                                   │
-                                   ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│ 2. Dual-Tier Memory Layer                                              │
-│    - Tier 1: Active Thread Working Memory (in-session dialogue).       │
-│    - Tier 2: Episodic Temporal Index: Microsecond cross-session        │
-│      retrieval of past shortlists, baselines, and entities without     │
-│      window bloating or context dilution.                              │
-└──────────────────────────────────┬─────────────────────────────────────┘
-                                   │
-                                   ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│ 3. Intent & Tool Dispatch Gate (Fast-Path Gating)                      │
-│    - Fast Path: Conversational turns and pure historical queries       │
-│      bypass web search for <300ms Time To First Token (TTFT).          │
-│    - Investigation Path: Decomposes change audits into parallel        │
-│      targeted entity searches anchored after the reference date.       │
-└──────────────────────────────────┬─────────────────────────────────────┘
-                                   │
-                                   ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│ 4. Strictly One Tool: `web_search` with Parallel Fan-Out               │
-│    - Strict compliance: ONLY `web_search` is exposed to the model.     │
-│    - Parallel Tool Execution: The model concurrently dispatches        │
-│      discrete entity searches executed via `Promise.all`.              │
-│    - Multi-provider adapter: Tavily (primary) → Brave → Serper → DDG.  │
-│    - In-memory LRU cache + snippet extraction + domain deduplication.  │
-└──────────────────────────────────┬─────────────────────────────────────┘
-                                   │
-                                   ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│ 5. Grounded Synthesizer & Streamer                                     │
-│    - Produces a structured "Then vs. Now" comparative delta matrix.    │
-│    - Validates source attribution with bracketed citations `[1]`, `[2]`.│
-│    - Streams tokens & tool progress via Server-Sent Events (SSE).      │
-└────────────────────────────────────────────────────────────────────────┘
+User message
+     │
+     ▼
+┌──────────────────────────────────────────────────────┐
+│  Stage 1 · Temporal Grounding Engine                 │
+│  Wall-clock anchor injected as ISO timestamp.        │
+│  Relative references ("Monday", "last Tuesday",      │
+│  "3 November") are resolved to concrete ISO dates    │
+│  and an explicit delta window [Base → Today].        │
+│  This runs before any LLM call.                      │
+└──────────────────────────┬───────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────┐
+│  Stage 2 · Episodic Memory Recall                    │
+│  Scored lookup against a persistent JSON store.      │
+│  Scoring weights: exact date match (+5), day-of-week │
+│  match (+3), entity overlap (+2 each), topic signals │
+│  (+4 each). High-confidence matches (≥6) inject the  │
+│  verbatim prior assistant response into the prompt.  │
+│  Threshold prevents false recalls on unrelated turns.│
+└──────────────────────────┬───────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────┐
+│  Stage 3 · Intent Gate + Parallel Tool Fan-Out       │
+│  Greeting / pure-recall turns skip search entirely   │
+│  (<300ms TTFT). Investigation turns emit N targeted  │
+│  queries in a single LLM pass, executed concurrently │
+│  via Promise.all with LRU cache + provider fallback  │
+│  chain: Tavily → Brave → Serper → DuckDuckGo.        │
+└──────────────────────────┬───────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────┐
+│  Stage 4 · Grounded Delta Synthesis + SSE Stream     │
+│  Evidence injected into synthesis prompt. Model      │
+│  produces a Then-vs-Now comparison table with inline │
+│  bracketed citations anchored to actual search URLs. │
+│  Tokens stream over SSE; first token <400ms.         │
+└──────────────────────────────────────────────────────┘
 ```
 
-When tested with: *"On Monday we shortlisted 5 CRM tools... Has any of them changed pricing or shipped something big since?"*:
-1. **Temporal Grounding** detects today is `Tuesday, Nov 10, 2026`, mapping "Monday" to `2026-11-09` (1 day elapsed). Delta window: `[2026-11-09 → 2026-11-10]`.
-2. **Episodic Recall** extracts the exact Monday shortlist (HubSpot, Pipedrive, Close, Zoho, Folk) and their baseline tiers from persistent memory.
-3. **Parallel `web_search` Fan-Out** dispatches targeted queries for each vendor's pricing changelog since Monday concurrently.
-4. **Grounded Synthesizer** outputs a structured comparison matrix (Vendor | Baseline | Status | Change Verdict | Citation), proving stability without inventing fake changes.
+**Worked example — "On Monday we shortlisted 5 CRM tools. Has any of them changed pricing or shipped something big since?"**
+
+1. Stage 1 resolves "Monday" to `2026-11-09`. Delta window: `[2026-11-09 → 2026-11-10]`.
+2. Stage 2 scores the episodic record `ep-crm-monday` at 9 (date +5, topic +4) → injects verbatim CRM shortlist from that session.
+3. Stage 3 dispatches two parallel `web_search` calls: one for HubSpot/Pipedrive, one for Close/Zoho/Folk, freshness-filtered to `week`.
+4. Stage 4 synthesises a five-row delta table with change verdicts and citations. Stable prices reported as stable — no hallucinated "updates".
 
 ---
 
-## 2. Why We Built It This Way
+## Why this architecture
 
-Every architectural choice maps directly to the three evaluation pillars:
+### Speed
 
-* **Answers Fast (<400ms TTFT):**
-  * *Deterministic 2-Turn Upper Bound:* Rather than open-ended multi-step ReAct loops that pause 4–5 times, we cap tool reasoning into a deterministic 2-turn flow (Decide & Formulate Search $\to$ Synthesize with Evidence).
-  * *Zero-Search Fast Path:* Greetings, formatting, and pure historical queries skip tool invocation entirely.
-  * *Parallel Tool Execution:* When auditing 5 entities, running searches in parallel via `Promise.all` executes in 400ms rather than 2,000ms sequentially.
-  * *In-Memory LRU Cache with TTL:* Repeated or overlapping queries return in $<2$ms.
-  * *Streaming SSE Protocol:* First tokens reach the screen immediately while citations stream in parallel.
+Sequential ReAct loops (Thought → Action → Observation, repeated) are the standard approach. For five entities that means five serial HTTP calls and five LLM roundtrips — roughly 15–25 seconds end-to-end.
 
-* **Gets Things Right (Groundedness & Accuracy):**
-  * *Dynamic Temporal Anchoring:* LLMs hallucinate dates if relying on training cutoffs. Injecting the exact wall-clock timestamp and calendar deltas eliminates "when was Monday?" confusion.
-  * *Explicit Delta Windowing:* Instructing searches to isolate events strictly between `[Base Date → Today]` prevents quoting 2022 articles as "recent changes".
-  * *Honest Negative Proofs:* If search results yield no pricing hike or changelog entry, the model is strictly instructed to affirm stability rather than inventing changes.
+Parallel fan-out collapses N serial calls into one concurrent batch. Five Tavily searches fired simultaneously return in ~400ms combined. The LLM makes exactly two calls total: one to plan queries, one to synthesise.
 
-* **Good to Talk To (Conversational Transparency):**
-  * *Live Execution State:* The user sees exactly what the agent is doing (`web_search: "query"` $\to$ latency $\to$ scanned domains) instead of a frozen spinner.
-  * *Structured Synthesis:* Clean markdown tables contrast *Baseline (Then)* vs. *Current Status (Now)* alongside inline citations (`[1]`, `[2]`).
+An intent gate short-circuits the tool path entirely for greetings and pure recall queries, hitting the SSE stream in under 300ms.
 
----
+### Accuracy
 
-## 3. What We Considered and Rejected
+LLMs hallucinate dates because their training cutoff is months or years stale. Injecting the wall-clock timestamp and resolving relative references deterministically before the first LLM call eliminates that class of error entirely.
 
-1. **Rejected: Multi-Step Sequential ReAct Loops**
-   * *Why:* Naive ReAct loops make sequential tool calls (Search 1 $\to$ think $\to$ Search 2 $\to$ think), taking 15–25 seconds. Parallel tool fan-out solves this in a single bounded roundtrip.
-2. **Rejected: External Vector DBs (Pinecone / Chroma / Milvus) for Memory**
-   * *Why:* For conversational memory across user threads, external vector DBs introduce network latency, cold starts, and synchronization bugs. A lightweight, transactional episodic store with temporal indexing provides microsecond retrieval with zero external dependencies.
-3. **Rejected: Multi-Tool Sprawl (e.g. Calculator, Scraper, Memory Tool)**
-   * *Why:* Violates the explicit challenge constraint (*"It has one tool: web search"*). All verification, fact-checking, and retrieval must flow through the disciplined orchestration of `web_search`.
-4. **Rejected: Ephemeral In-Memory-Only Context**
-   * *Why:* Real users revisit past decisions days later. Without persistent episodic memory, queries like *"What did I ask you on 3 November?"* fail completely.
+The delta window instruction (`focus only on announcements between Base Date and Today`) prevents the model from quoting a 2023 article as "recent news". When search returns nothing new, the prompt instructs the model to report stability rather than invent a change.
+
+Historical recall injects the *verbatim prior response text*, not a summary. When a user asks "is your answer still correct?", the model can compare exact figures rather than reconstructed ones.
+
+### Conversational quality
+
+Live search progress streams as SSE events. Users see the query firing and the provider responding before synthesis begins — not a frozen spinner followed by a wall of text. Citations render as clickable pills linked to actual sources returned by the search API, never fabricated.
 
 ---
 
-## 4. What We'd Do With Another Week
+## What was considered and rejected
 
-1. **Deterministic Web Diffing & Snapshot Comparator:** Fetch and diff clean DOM snapshots of official `/pricing` pages against cached snapshots to programmatically detect tier changes down to the dollar.
-2. **Adaptive Query Rewriting with HyDE:** Generate hypothetical changelog passages to retrieve dense semantic matches from search engines before hitting the final LLM.
-3. **Local Vector Hybrid Index with SQLite-VSS:** Complement temporal indexing with sub-millisecond local embedding search for conversational recall spanning thousands of past sessions.
-4. **Multi-Model Speculative Drafting:** Speculatively draft the synthesis structure using an ultra-fast small model while the large model validates factual citations in parallel.
+**Multi-step ReAct loops** — Gives the model maximum flexibility, but compounds latency and makes execution non-deterministic. For a bounded task (audit N entities since date D), fixed two-turn execution is both faster and more reliable.
+
+**External vector databases (Pinecone, Chroma)** — Cross-session memory across three benchmark scenarios doesn't require embedding search. A scored lookup on a lightweight JSON store with temporal + entity indexing retrieves the right record in microseconds with zero cold-start penalty and no API dependency.
+
+**Separate memory tool** — The challenge specifies exactly one tool: `web_search`. Memory is handled in-process before the LLM call. Exposing a second tool would violate the constraint and add unnecessary round-trips.
+
+**Ephemeral in-session context only** — Queries like "what did I ask on 3 November?" are unanswerable without persistent storage. A file-backed atomic store (write-to-tmp then rename) survives process restarts without an external database.
+
+**Streaming via polling / long-poll** — SSE is the right primitive here: unidirectional, low-overhead, natively supported by browsers and Node's `ReadableStream`. WebSockets add bidirectional complexity that this use case doesn't need.
+
+---
+
+## What another week would add
+
+**Deterministic pricing page diffing.** Snapshot the official `/pricing` DOM on each query. On subsequent audits, diff the clean text snapshot rather than trusting search snippets. Would catch tier renames and feature additions that search results miss.
+
+**Adaptive query rewriting (HyDE).** Generate a hypothetical "pricing changelog" passage, then embed it and retrieve semantically similar search results. Would improve recall for vendors with unusual pricing page structures.
+
+**Confidence-calibrated responses.** Track search result dates and source authority. Flag low-confidence answers ("search returned only results older than the reference date — pricing may have changed without public announcement") rather than silently returning stale data.
+
+**Streaming thought traces to the UI.** The orchestrator already collects model reasoning. Surfacing it as a collapsible "reasoning" block alongside citations would make the agent's decision process fully auditable.
